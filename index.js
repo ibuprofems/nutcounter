@@ -675,6 +675,8 @@ async function buildLeaderboardEmbed(guild, guildState, seasonNumber) {
 }
 
 async function registerCommandsForGuild(guildId) {
+  console.log(`Registering slash commands for guild ${guildId}...`);
+
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, guildId), {
     body: commands,
   });
@@ -683,9 +685,15 @@ async function registerCommandsForGuild(guildId) {
 }
 
 async function registerCommandsForAllGuilds() {
-  for (const guild of client.guilds.cache.values()) {
-    await ensureGuildRecord(guild.id);
-    await registerCommandsForGuild(guild.id);
+  const guilds = await client.guilds.fetch();
+  console.log(`Found ${guilds.size} guild(s) for command registration.`);
+
+  for (const [guildId, guildPreview] of guilds) {
+    console.log(
+      `Initializing guild ${guildPreview.name || "Unknown"} (${guildId})`
+    );
+    await ensureGuildRecord(guildId);
+    await registerCommandsForGuild(guildId);
   }
 }
 
@@ -772,6 +780,7 @@ function buildHelpEmbed(isAuthorized) {
 
 client.once("clientReady", async (readyClient) => {
   console.log(`NutBot is online as ${readyClient.user.tag}`);
+  console.log(`Bot is currently in ${readyClient.guilds.cache.size} guild(s).`);
 
   try {
     await registerCommandsForAllGuilds();
@@ -782,6 +791,7 @@ client.once("clientReady", async (readyClient) => {
 
 client.on("guildCreate", async (guild) => {
   try {
+    console.log(`Joined new guild ${guild.name} (${guild.id})`);
     await ensureGuildRecord(guild.id);
     await registerCommandsForGuild(guild.id);
   } catch (error) {
