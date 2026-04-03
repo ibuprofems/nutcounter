@@ -19,6 +19,43 @@ process.on("unhandledRejection", (reason) =>
   console.error("Unhandled Rejection:", reason)
 );
 
+let isShuttingDown = false;
+
+async function shutdown(signal) {
+  if (isShuttingDown) {
+    return;
+  }
+
+  isShuttingDown = true;
+  console.warn(`Received ${signal}. Shutting down NutBot...`);
+
+  try {
+    await client.destroy();
+  } catch (error) {
+    console.error("Failed to destroy Discord client cleanly:", error);
+  }
+
+  try {
+    await dbClient.close();
+  } catch (error) {
+    console.error("Failed to close MongoDB cleanly:", error);
+  }
+
+  process.exit(0);
+}
+
+process.on("SIGINT", () => {
+  shutdown("SIGINT").catch((error) =>
+    console.error("Shutdown error after SIGINT:", error)
+  );
+});
+
+process.on("SIGTERM", () => {
+  shutdown("SIGTERM").catch((error) =>
+    console.error("Shutdown error after SIGTERM:", error)
+  );
+});
+
 const TOKEN = process.env.TOKEN;
 const MONGO_URI = process.env.MONGO_URI;
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -50,6 +87,14 @@ let guildCollection;
 let seasonCollection;
 let metaCollection;
 
+dbClient.on("close", () => {
+  console.warn("MongoDB connection closed.");
+});
+
+dbClient.on("error", (error) => {
+  console.error("MongoDB error:", error);
+});
+
 const commands = [
   new SlashCommandBuilder()
     .setName("setup")
@@ -62,6 +107,11 @@ const commands = [
         .setDescription("Activation password")
         .setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName("adminstatus")
+    .setDescription("Show NutBot runtime status for this server")
+    .setDMPermission(false)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder()
     .setName("nut")
     .setDescription("See your nut totals")
@@ -445,6 +495,27 @@ async function getSeasonUser(guildId, userId, seasonNumber) {
   return seasonCollection.findOne({ guildId, userId, seasonNumber });
 }
 
+async function claimNextCount(guildId, expectedLastNumber) {
+  const nextNumber = expectedLastNumber + 1;
+  const result = await guildCollection.updateOne(
+    {
+      _id: guildId,
+      lastNumber: expectedLastNumber,
+    },
+    {
+      $set: {
+        lastNumber: nextNumber,
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  return {
+    claimed: result.modifiedCount === 1,
+    nextNumber,
+  };
+}
+
 async function addNut(guildId, userId, seasonNumber) {
   const now = new Date();
   const oneHourAgo = subtractHours(now, 1);
@@ -767,6 +838,7 @@ function buildHelpEmbed(isAuthorized) {
     )
     .addFields(
       { name: "/setup password", value: "Admin-only server activation." },
+      { name: "/adminstatus", value: "Admin-only bot health and setup status." },
       { name: "/count", value: "Show the current count for this server." },
       { name: "/nut", value: "Show your lifetime and current season totals." },
       { name: "/mystats [season]", value: "Show your stats for now or a legacy season." },
@@ -789,6 +861,40 @@ client.once("clientReady", async (readyClient) => {
   }
 });
 
+client.on("error", (error) => {
+  console.error("Discord client error:", error);
+});
+
+client.on("warn", (warning) => {
+  console.warn("Discord client warning:", warning);
+});
+
+client.on("shardDisconnect", (event, shardId) => {
+  console.warn(
+    `Discord shard ${shardId} disconnected with code ${event.code}. Clean: ${event.wasClean}`
+  );
+});
+
+client.on("shardError", (error, shardId) => {
+  console.error(`Discord shard ${shardId} error:`, error);
+});
+
+client.on("shardReady", (shardId, unavailableGuilds) => {
+  console.log(
+    `Discord shard ${shardId} ready. Unavailable guilds: ${unavailableGuilds?.size || 0}`
+  );
+});
+
+client.on("shardReconnecting", (shardId) => {
+  console.warn(`Discord shard ${shardId} reconnecting...`);
+});
+
+client.on("shardResume", (shardId, replayedEvents) => {
+  console.log(
+    `Discord shard ${shardId} resumed after replaying ${replayedEvents} event(s).`
+  );
+});
+
 client.on("guildCreate", async (guild) => {
   try {
     console.log(`Joined new guild ${guild.name} (${guild.id})`);
@@ -799,13 +905,37 @@ client.on("guildCreate", async (guild) => {
   }
 });
 
-cron.schedule("0 0 * * *", runDailyCountAnnouncement, {
-  timezone: BOT_TIMEZONE,
-});
+cron.schedule(
+  "0 0 * * *",
+  async () => {
+    try {
+      console.log("Starting nightly count announcement job...");
+      await runDailyCountAnnouncement();
+      console.log("Nightly count announcement job completed.");
+    } catch (error) {
+      console.error("Nightly count announcement job failed:", error);
+    }
+  },
+  {
+    timezone: BOT_TIMEZONE,
+  }
+);
 
-cron.schedule("5 0 * * 0", runWeeklyReset, {
-  timezone: BOT_TIMEZONE,
-});
+cron.schedule(
+  "5 0 * * 0",
+  async () => {
+    try {
+      console.log("Starting weekly reset job...");
+      await runWeeklyReset();
+      console.log("Weekly reset job completed.");
+    } catch (error) {
+      console.error("Weekly reset job failed:", error);
+    }
+  },
+  {
+    timezone: BOT_TIMEZONE,
+  }
+);
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) {
@@ -834,12 +964,18 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    const incomingNumber = nextNumber;
+    const claim = await claimNextCount(message.guild.id, guildState.lastNumber);
 
-    await guildCollection.updateOne(
-      { _id: message.guild.id },
-      { $set: { lastNumber: incomingNumber, updatedAt: new Date() } }
-    );
+    if (!claim.claimed) {
+      const freshGuildState = await getGuildState(message.guild.id);
+      console.warn(
+        `Count race detected in guild ${message.guild.id}. Expected ${nextNumber}, actual next is ${(freshGuildState.lastNumber || 0) + 1}.`
+      );
+      await message.reply(
+        buildWrongCountMessage((freshGuildState.lastNumber || 0) + 1)
+      );
+      return;
+    }
 
     const stats = await addNut(
       message.guild.id,
@@ -936,6 +1072,73 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     const guildState = await getGuildState(interaction.guildId);
+
+    if (commandName === "adminstatus") {
+      if (
+        !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+      ) {
+        await interaction.reply({
+          content: "Only a server admin can use this command.",
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const countChannel = await findCountChannel(interaction.guild);
+      const dbState = guildState.authorized ? "Connected" : "Connected (inactive)";
+      const uptimeMs = client.uptime || 0;
+      const uptimeMinutes = Math.floor(uptimeMs / 60000);
+      const uptimeHours = Math.floor(uptimeMinutes / 60);
+      const uptimeRemainderMinutes = uptimeMinutes % 60;
+
+      await interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("NutBot Admin Status")
+            .setColor("DarkGreen")
+            .addFields(
+              {
+                name: "Server Active",
+                value: guildState.authorized ? "Yes" : "No",
+                inline: true,
+              },
+              {
+                name: "Count Channel",
+                value: countChannel ? `#${COUNT_CHANNEL_NAME}` : "Missing",
+                inline: true,
+              },
+              {
+                name: "Current Count",
+                value: formatNumber(guildState.lastNumber || 0),
+                inline: true,
+              },
+              {
+                name: "Current Season",
+                value: `Season ${guildState.seasonNumber || 1}`,
+                inline: true,
+              },
+              {
+                name: "Discord Status",
+                value: client.isReady() ? "Ready" : "Not ready",
+                inline: true,
+              },
+              {
+                name: "Database Status",
+                value: dbState,
+                inline: true,
+              },
+              {
+                name: "Bot Uptime",
+                value: `${uptimeHours}h ${uptimeRemainderMinutes}m`,
+                inline: true,
+              }
+            )
+            .setTimestamp(),
+        ],
+        ephemeral: true,
+      });
+      return;
+    }
 
     if (commandName === "help") {
       await interaction.reply({ embeds: [buildHelpEmbed(guildState.authorized)] });
