@@ -69,6 +69,7 @@ const TOP_LIMIT = 5;
 const MILESTONE_INTERVAL = 25;
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
 const HOUR_IN_MS = 60 * 60 * 1000;
+const RECONCILE_MESSAGE_LIMIT = 100;
 const CARE_REMINDERS = [
   "Make sure to drink some water and use lotion!",
   "Hydrate. Stretch. Maybe take a lap before the next one.",
@@ -516,6 +517,138 @@ async function claimNextCount(guildId, expectedLastNumber) {
   };
 }
 
+async function recordRecoveredNut(guildId, userId, seasonNumber, occurredAt) {
+  const currentUser = await getUser(guildId, userId);
+  const now = new Date();
+
+  if (!currentUser) {
+    await userCollection.insertOne({
+      guildId,
+      userId,
+      nuts: 1,
+      weeklyNuts: 1,
+      firstNutAt: occurredAt,
+      recentNutTimestamps: [],
+      updatedAt: now,
+    });
+  } else {
+    await userCollection.updateOne(
+      { guildId, userId },
+      {
+        $set: { updatedAt: now },
+        $inc: { nuts: 1, weeklyNuts: 1 },
+      }
+    );
+  }
+
+  await seasonCollection.updateOne(
+    { guildId, userId, seasonNumber },
+    {
+      $inc: { nuts: 1 },
+      $set: { updatedAt: now },
+      $setOnInsert: { firstNutAt: occurredAt },
+    },
+    { upsert: true }
+  );
+}
+
+async function reconcileGuildCountFromChannel(guild, currentGuildState) {
+  const guildState = currentGuildState || (await getGuildState(guild.id));
+  const channel = await findCountChannel(guild);
+
+  if (!channel || !guildState.authorized) {
+    return guildState;
+  }
+
+  const messages = await channel.messages
+    .fetch({ limit: RECONCILE_MESSAGE_LIMIT })
+    .catch((error) => {
+      console.error(
+        `Failed to fetch recent messages for reconciliation in guild ${guild.id}:`,
+        error
+      );
+      return null;
+    });
+
+  if (!messages || messages.size === 0) {
+    return guildState;
+  }
+
+  let resolvedLastNumber = guildState.lastNumber || 0;
+  const recoveredMessages = [];
+  const orderedMessages = [...messages.values()].sort(
+    (left, right) => left.createdTimestamp - right.createdTimestamp
+  );
+
+  for (const message of orderedMessages) {
+    if (message.author.bot) {
+      continue;
+    }
+
+    const content = message.content.trim();
+    if (content !== String(resolvedLastNumber + 1)) {
+      continue;
+    }
+
+    resolvedLastNumber += 1;
+
+    if (resolvedLastNumber > (guildState.lastNumber || 0)) {
+      recoveredMessages.push(message);
+    }
+  }
+
+  if (resolvedLastNumber === (guildState.lastNumber || 0)) {
+    return guildState;
+  }
+
+  console.warn(
+    `Reconciling guild ${guild.id} from ${guildState.lastNumber || 0} to ${resolvedLastNumber} using recent channel history.`
+  );
+
+  for (const message of recoveredMessages) {
+    await recordRecoveredNut(
+      guild.id,
+      message.author.id,
+      guildState.seasonNumber,
+      new Date(message.createdTimestamp)
+    );
+  }
+
+  await guildCollection.updateOne(
+    { _id: guild.id },
+    {
+      $set: {
+        lastNumber: resolvedLastNumber,
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  return {
+    ...guildState,
+    lastNumber: resolvedLastNumber,
+  };
+}
+
+async function reconcileAllGuildsFromHistory() {
+  const guilds = await client.guilds.fetch();
+
+  for (const [guildId] of guilds) {
+    const guild = await client.guilds.fetch(guildId).catch(() => null);
+
+    if (!guild) {
+      continue;
+    }
+
+    try {
+      const guildState = await getGuildState(guild.id);
+      await reconcileGuildCountFromChannel(guild, guildState);
+    } catch (error) {
+      console.error(`Failed to reconcile guild ${guild.id}:`, error);
+    }
+  }
+}
+
 async function addNut(guildId, userId, seasonNumber) {
   const now = new Date();
   const oneHourAgo = subtractHours(now, 1);
@@ -856,6 +989,7 @@ client.once("clientReady", async (readyClient) => {
 
   try {
     await registerCommandsForAllGuilds();
+    await reconcileAllGuildsFromHistory();
   } catch (error) {
     console.error("Failed to register slash commands:", error);
   }
@@ -893,6 +1027,10 @@ client.on("shardResume", (shardId, replayedEvents) => {
   console.log(
     `Discord shard ${shardId} resumed after replaying ${replayedEvents} event(s).`
   );
+
+  reconcileAllGuildsFromHistory().catch((error) => {
+    console.error("Guild reconciliation after shard resume failed:", error);
+  });
 });
 
 client.on("guildCreate", async (guild) => {
@@ -950,7 +1088,7 @@ client.on("messageCreate", async (message) => {
   }
 
   try {
-    const guildState = await refreshGuildSeason(message.guild.id);
+    let guildState = await refreshGuildSeason(message.guild.id);
 
     if (!guildState.authorized) {
       return;
@@ -960,7 +1098,45 @@ client.on("messageCreate", async (message) => {
     const content = message.content.trim();
 
     if (content !== String(nextNumber)) {
-      await message.reply(buildWrongCountMessage(nextNumber));
+      guildState = await reconcileGuildCountFromChannel(message.guild, guildState);
+      const reconciledNextNumber = (guildState.lastNumber || 0) + 1;
+
+      if (content === String(reconciledNextNumber)) {
+        const claim = await claimNextCount(message.guild.id, guildState.lastNumber);
+
+        if (!claim.claimed) {
+          const freshGuildState = await getGuildState(message.guild.id);
+          console.warn(
+            `Count race detected in guild ${message.guild.id}. Expected ${reconciledNextNumber}, actual next is ${(freshGuildState.lastNumber || 0) + 1}.`
+          );
+          await message.reply(
+            buildWrongCountMessage((freshGuildState.lastNumber || 0) + 1)
+          );
+          return;
+        }
+
+        const stats = await addNut(
+          message.guild.id,
+          message.author.id,
+          guildState.seasonNumber
+        );
+
+        if (stats.isMilestone) {
+          await message.channel.send({
+            embeds: [buildMilestoneEmbed(message.author.id, stats)],
+          });
+        }
+
+        if (stats.shouldSendCareReminder) {
+          await message.channel.send(
+            `<@${message.author.id}> ${getRandomCareReminder()}`
+          );
+        }
+
+        return;
+      }
+
+      await message.reply(buildWrongCountMessage(reconciledNextNumber));
       return;
     }
 
