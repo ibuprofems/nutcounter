@@ -412,6 +412,8 @@ async function ensureGuildRecord(guildId) {
     authorized: isLegacyGuild,
     channelName: COUNT_CHANNEL_NAME,
     lastNumber: 0,
+    lastCountMessageId: null,
+    lastCountMessageTimestamp: null,
     seasonNumber: 1,
     seasonStartedAt: now,
     createdAt: now,
@@ -441,6 +443,8 @@ async function authorizeGuild(guildId, activatedBy) {
       },
       $setOnInsert: {
         lastNumber: 0,
+        lastCountMessageId: null,
+        lastCountMessageTimestamp: null,
         createdAt: now,
       },
     },
@@ -496,7 +500,7 @@ async function getSeasonUser(guildId, userId, seasonNumber) {
   return seasonCollection.findOne({ guildId, userId, seasonNumber });
 }
 
-async function claimNextCount(guildId, expectedLastNumber) {
+async function claimNextCount(guildId, expectedLastNumber, message = null) {
   const nextNumber = expectedLastNumber + 1;
   const result = await guildCollection.updateOne(
     {
@@ -506,6 +510,12 @@ async function claimNextCount(guildId, expectedLastNumber) {
     {
       $set: {
         lastNumber: nextNumber,
+        ...(message
+          ? {
+              lastCountMessageId: message.id,
+              lastCountMessageTimestamp: new Date(message.createdTimestamp),
+            }
+          : {}),
         updatedAt: new Date(),
       },
     }
@@ -619,6 +629,16 @@ async function reconcileGuildCountFromChannel(guild, currentGuildState) {
     {
       $set: {
         lastNumber: resolvedLastNumber,
+        lastCountMessageId:
+          recoveredMessages[recoveredMessages.length - 1]?.id ||
+          guildState.lastCountMessageId ||
+          null,
+        lastCountMessageTimestamp:
+          recoveredMessages[recoveredMessages.length - 1]
+            ? new Date(
+                recoveredMessages[recoveredMessages.length - 1].createdTimestamp
+              )
+            : guildState.lastCountMessageTimestamp || null,
         updatedAt: new Date(),
       },
     }
@@ -627,6 +647,16 @@ async function reconcileGuildCountFromChannel(guild, currentGuildState) {
   return {
     ...guildState,
     lastNumber: resolvedLastNumber,
+    lastCountMessageId:
+      recoveredMessages[recoveredMessages.length - 1]?.id ||
+      guildState.lastCountMessageId ||
+      null,
+    lastCountMessageTimestamp:
+      recoveredMessages[recoveredMessages.length - 1]
+        ? new Date(
+            recoveredMessages[recoveredMessages.length - 1].createdTimestamp
+          )
+        : guildState.lastCountMessageTimestamp || null,
   };
 }
 
@@ -1095,7 +1125,17 @@ client.on("messageCreate", async (message) => {
     }
 
     const content = message.content.trim();
-    if (!/^\d+$/.test(content)) {
+    const lastCountMessageTimestamp = guildState.lastCountMessageTimestamp
+      ? new Date(guildState.lastCountMessageTimestamp).getTime()
+      : null;
+
+    if (
+      lastCountMessageTimestamp &&
+      message.createdTimestamp <= lastCountMessageTimestamp
+    ) {
+      console.warn(
+        `Ignoring stale message ${message.id} in guild ${message.guild.id}; it predates the latest accepted count message.`
+      );
       return;
     }
 
@@ -1103,10 +1143,28 @@ client.on("messageCreate", async (message) => {
 
     if (content !== String(nextNumber)) {
       guildState = await reconcileGuildCountFromChannel(message.guild, guildState);
+      const reconciledLastCountMessageTimestamp = guildState.lastCountMessageTimestamp
+        ? new Date(guildState.lastCountMessageTimestamp).getTime()
+        : null;
+
+      if (
+        reconciledLastCountMessageTimestamp &&
+        message.createdTimestamp <= reconciledLastCountMessageTimestamp
+      ) {
+        console.warn(
+          `Ignoring stale message ${message.id} in guild ${message.guild.id} after reconciliation.`
+        );
+        return;
+      }
+
       const reconciledNextNumber = (guildState.lastNumber || 0) + 1;
 
       if (content === String(reconciledNextNumber)) {
-        const claim = await claimNextCount(message.guild.id, guildState.lastNumber);
+        const claim = await claimNextCount(
+          message.guild.id,
+          guildState.lastNumber,
+          message
+        );
 
         if (!claim.claimed) {
           const freshGuildState = await getGuildState(message.guild.id);
@@ -1144,7 +1202,11 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    const claim = await claimNextCount(message.guild.id, guildState.lastNumber);
+    const claim = await claimNextCount(
+      message.guild.id,
+      guildState.lastNumber,
+      message
+    );
 
     if (!claim.claimed) {
       const freshGuildState = await getGuildState(message.guild.id);
