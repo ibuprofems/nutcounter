@@ -1094,8 +1094,12 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    const nextNumber = guildState.lastNumber + 1;
     const content = message.content.trim();
+    if (!/^\d+$/.test(content)) {
+      return;
+    }
+
+    const nextNumber = guildState.lastNumber + 1;
 
     if (content !== String(nextNumber)) {
       guildState = await reconcileGuildCountFromChannel(message.guild, guildState);
